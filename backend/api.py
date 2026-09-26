@@ -35,6 +35,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS frozen_packages (
+    id serial PRIMARY KEY,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS frozen_items (
+    id serial PRIMARY KEY,
+    package_id integer NOT NULL REFERENCES frozen_packages(id),
+    job_id integer NOT NULL UNIQUE,
+    sheet text NOT NULL,
+    cyan_mm double precision NOT NULL,
+    magenta_mm double precision NOT NULL,
+    verdict text NOT NULL,
+    reason text NOT NULL
+);
 """
 
 
@@ -45,6 +60,15 @@ class LoginIn(BaseModel):
 
 class JobIn(BaseModel):
     sheet: str
+    cyan_mm: float
+    magenta_mm: float
+
+
+class FreezeIn(BaseModel):
+    job_ids: list[int]
+
+
+class ReviseIn(BaseModel):
     cyan_mm: float
     magenta_mm: float
 
@@ -64,6 +88,12 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
         raise HTTPException(status_code=403, detail="仅印刷员可送复核")
+    return user
+
+
+def require_signer(user: dict = Depends(current_user)) -> dict:
+    if user["role"] != "writer":
+        raise HTTPException(status_code=403, detail="仅印刷员可签发冻结包")
     return user
 
 
@@ -106,7 +136,11 @@ def login(body: LoginIn):
 def list_jobs(_user: dict = Depends(current_user)):
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            """SELECT j.id, j.sheet, j.cyan_mm, j.magenta_mm, j.status, j.verdict, j.reason,
+                      j.created_by, f.package_id AS frozen_package_id
+               FROM jobs j
+               LEFT JOIN frozen_items f ON f.job_id = j.id
+               ORDER BY j.id DESC"""
         ).fetchall()
 
 
@@ -121,3 +155,110 @@ def enqueue(body: JobIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+@app.post("/api/jobs/{job_id}/revise")
+def revise(job_id: int, body: ReviseIn, user: dict = Depends(require_writer)):
+    # 模拟现场改动某行偏差：重填新数值并重新送判定，冻结包内快照不受影响
+    with connect() as conn:
+        row = conn.execute(
+            """UPDATE jobs SET cyan_mm = %s, magenta_mm = %s, status = 'pending',
+                              verdict = '', reason = ''
+               WHERE id = %s
+               RETURNING id, sheet, status, verdict""",
+            (body.cyan_mm, body.magenta_mm, job_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="印张不存在")
+        conn.commit()
+    return row
+
+
+@app.get("/api/freeze/candidates")
+def freeze_candidates(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            """SELECT j.id, j.sheet, j.cyan_mm, j.magenta_mm, j.verdict, j.reason
+               FROM jobs j
+               LEFT JOIN frozen_items f ON f.job_id = j.id
+               WHERE j.status = 'done' AND f.job_id IS NULL
+               ORDER BY j.id"""
+        ).fetchall()
+
+
+@app.post("/api/freeze", status_code=201)
+def freeze(body: FreezeIn, user: dict = Depends(require_signer)):
+    job_ids = sorted(set(body.job_ids))
+    if not job_ids:
+        raise HTTPException(status_code=400, detail="未选择要签发的印张")
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT j.id, j.sheet, j.cyan_mm, j.magenta_mm, j.status, j.verdict, j.reason,
+                      f.package_id AS frozen_package_id
+               FROM jobs j
+               LEFT JOIN frozen_items f ON f.job_id = j.id
+               WHERE j.id = ANY(%s)
+               ORDER BY j.id
+               FOR UPDATE OF j""",
+            (job_ids,),
+        ).fetchall()
+        found = {row["id"] for row in rows}
+        missing = [i for i in job_ids if i not in found]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"印张不存在: {missing}")
+        not_done = [row["id"] for row in rows if row["status"] != "done"]
+        if not_done:
+            raise HTTPException(status_code=409, detail=f"印张尚未出结论: {not_done}")
+        already = [row["id"] for row in rows if row["frozen_package_id"] is not None]
+        if already:
+            raise HTTPException(status_code=409, detail=f"印张已在冻结包内: {already}")
+        package = conn.execute(
+            "INSERT INTO frozen_packages (created_by, created_at) VALUES (%s, %s) RETURNING id",
+            (user["username"], datetime.now(timezone.utc)),
+        ).fetchone()
+        for row in rows:
+            conn.execute(
+                """INSERT INTO frozen_items
+                       (package_id, job_id, sheet, cyan_mm, magenta_mm, verdict, reason)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    package["id"],
+                    row["id"],
+                    row["sheet"],
+                    row["cyan_mm"],
+                    row["magenta_mm"],
+                    row["verdict"],
+                    row["reason"],
+                ),
+            )
+        conn.commit()
+    return {"id": package["id"], "count": len(rows)}
+
+
+@app.get("/api/freeze/packages")
+def list_packages(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            """SELECT p.id, p.created_by, p.created_at, COUNT(i.id) AS item_count
+               FROM frozen_packages p
+               LEFT JOIN frozen_items i ON i.package_id = p.id
+               GROUP BY p.id
+               ORDER BY p.id DESC"""
+        ).fetchall()
+
+
+@app.get("/api/freeze/packages/{package_id}")
+def package_detail(package_id: int, _user: dict = Depends(current_user)):
+    with connect() as conn:
+        package = conn.execute(
+            "SELECT id, created_by, created_at FROM frozen_packages WHERE id = %s",
+            (package_id,),
+        ).fetchone()
+        if package is None:
+            raise HTTPException(status_code=404, detail="冻结包不存在")
+        items = conn.execute(
+            """SELECT id, job_id, sheet, cyan_mm, magenta_mm, verdict, reason
+               FROM frozen_items WHERE package_id = %s ORDER BY id""",
+            (package_id,),
+        ).fetchall()
+    return {**package, "items": items}

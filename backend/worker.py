@@ -35,6 +35,25 @@ def ensure():
                 created_at timestamptz NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS frozen_packages (
+                id serial PRIMARY KEY,
+                created_by text NOT NULL,
+                created_at timestamptz NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS frozen_items (
+                id serial PRIMARY KEY,
+                package_id integer NOT NULL REFERENCES frozen_packages(id),
+                job_id integer NOT NULL UNIQUE,
+                sheet text NOT NULL,
+                cyan_mm double precision NOT NULL,
+                magenta_mm double precision NOT NULL,
+                verdict text NOT NULL,
+                reason text NOT NULL
+            )"""
+        )
         conn.commit()
 
 
